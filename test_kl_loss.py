@@ -1,20 +1,24 @@
 """
-Test: verify that ChunkedLogitsKLLoss produces the same output and gradients
-as the original LogitsKLLoss from NeMo's distillation code.
+Test: verify that ChunkedKLDivFunction (custom autograd) produces the same
+output and gradients as the original LogitsKLLoss from NeMo.
 
 Run with torchrun on 4 GPUs (one node, TP=4):
     torchrun --nproc_per_node 4 test_kl_loss.py
 
 What this test does:
-    1. Initializes TP=4 (tensor parallel) using Megatron's parallel_state.
-    2. Creates random student logits (requires_grad=True) and teacher logits (detached).
-       Shape: (seq_len, batch, sharded_vocab_size) where sharded_vocab_size = vocab_size / TP.
-    3. Runs ORIGINAL LogitsKLLoss.forward() -> gets loss and student gradient.
-    4. Runs CHUNKED LogitsKLLoss.forward() -> gets loss and student gradient.
-    5. Compares:
-       - Losses are close (atol=1e-5, rtol=1e-5)
-       - Gradients are close (atol=1e-5, rtol=1e-5)
+    1. Initializes TP=4 using Megatron's parallel_state.
+    2. Creates random student logits (requires_grad) and teacher logits (detached).
+    3. Runs ORIGINAL forward + backward -> gets loss and gradient.
+    4. Runs CHUNKED (custom autograd) forward + backward -> gets loss and gradient.
+    5. Compares losses and gradients are numerically close.
     6. Prints PASS or FAIL.
+
+Why custom autograd:
+    The original code materializes several (seq, batch, vocab) fp32 tensors at once,
+    AND autograd saves more for backward. With custom forward/backward, we:
+    - Forward: compute loss under no_grad, save only inputs (no intermediates).
+    - Backward: recompute each chunk with autograd to get gradients, then free.
+    Peak memory = one chunk's intermediates, not the full sequence.
 """
 
 import os
@@ -50,7 +54,7 @@ def all_reduce_autograd(tensor, op=dist.ReduceOp.SUM, group=dist.group.WORLD):
 def original_kl_loss(output_student, output_teacher, tp_group):
     """
     Original NeMo KL loss for TP > 1.
-    Inputs are already fp32 and temperature-scaled.
+    Inputs: fp32 logits, already temperature-scaled.
     Returns per-token loss: shape (seq, batch).
     """
     # Teacher softmax
@@ -85,58 +89,115 @@ def original_kl_loss(output_student, output_teacher, tp_group):
 
 
 # ──────────────────────────────────────────────────────────────
-# CHUNKED: same math, but processes sequence in chunks
+# CHUNKED: custom autograd function
 # ──────────────────────────────────────────────────────────────
+
+def _compute_chunk_kl(student_chunk, teacher_chunk, tp_group):
+    """
+    Compute KL divergence loss for one sequence chunk.
+    Works identically with or without autograd enabled.
+
+    Args:
+        student_chunk: (chunk_len, batch, sharded_vocab) fp32, may require grad.
+        teacher_chunk: (chunk_len, batch, sharded_vocab) fp32, detached.
+        tp_group: tensor parallel process group.
+
+    Returns:
+        Per-token KL loss: (chunk_len, batch).
+    """
+    # Teacher softmax (no grad flows through teacher)
+    t_max, _ = torch.max(teacher_chunk, dim=-1)
+    dist.all_reduce(t_max, op=dist.ReduceOp.MAX, group=tp_group)
+    teacher_shifted = teacher_chunk - t_max.unsqueeze(dim=-1)
+
+    t_denom = torch.sum(torch.exp(teacher_shifted), dim=-1)
+    t_denom = all_reduce_autograd(t_denom, group=tp_group)
+
+    clen, bsz, svocab = student_chunk.shape
+    t_log_prob = teacher_shifted - torch.log(t_denom).view(clen, bsz, 1).expand(clen, bsz, svocab)
+
+    # Student softmax (grad flows through here)
+    s_max, _ = torch.max(student_chunk, dim=-1)
+    dist.all_reduce(s_max, op=dist.ReduceOp.MAX, group=tp_group)
+    student_shifted = student_chunk - s_max.unsqueeze(dim=-1).detach()
+
+    s_denom = torch.sum(torch.exp(student_shifted), dim=-1)
+    s_denom = all_reduce_autograd(s_denom, group=tp_group)
+
+    s_log_prob = student_shifted - torch.log(s_denom).view(clen, bsz, 1).expand(clen, bsz, svocab)
+
+    # KL div, summed over vocab -> (chunk_len, batch)
+    loss = torch.sum(
+        F.kl_div(s_log_prob, t_log_prob, reduction="none", log_target=True),
+        dim=-1,
+    )
+    return loss
+
+
+class ChunkedKLDivFunction(torch.autograd.Function):
+    """
+    Custom autograd for chunked KL divergence.
+
+    Forward:  compute loss under no_grad (no intermediates saved by autograd).
+    Backward: recompute each chunk with autograd to get gradients, then free.
+
+    Only the original inputs are saved between forward and backward.
+    """
+
+    @staticmethod
+    def forward(ctx, output_student, output_teacher, tp_group, chunk_size):
+        # Save inputs for backward. No intermediates are saved.
+        ctx.save_for_backward(output_student, output_teacher)
+        ctx.tp_group = tp_group
+        ctx.chunk_size = chunk_size
+
+        slen = output_student.shape[0]
+        loss_chunks = []
+
+        with torch.no_grad():
+            for start in range(0, slen, chunk_size):
+                end = min(start + chunk_size, slen)
+                chunk_loss = _compute_chunk_kl(
+                    output_student[start:end],
+                    output_teacher[start:end],
+                    tp_group,
+                )
+                loss_chunks.append(chunk_loss)
+
+        return torch.cat(loss_chunks, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output_student, output_teacher = ctx.saved_tensors
+        tp_group = ctx.tp_group
+        chunk_size = ctx.chunk_size
+
+        slen = output_student.shape[0]
+        grad_student = torch.zeros_like(output_student)
+
+        for start in range(0, slen, chunk_size):
+            end = min(start + chunk_size, slen)
+
+            # Detach chunk and enable grad so we can differentiate through it.
+            s_chunk = output_student[start:end].detach().requires_grad_(True)
+            t_chunk = output_teacher[start:end].detach()
+
+            # Recompute this chunk's loss WITH autograd.
+            chunk_loss = _compute_chunk_kl(s_chunk, t_chunk, tp_group)
+
+            # Chain rule: weight by incoming gradient, then backprop.
+            (chunk_loss * grad_output[start:end]).sum().backward()
+
+            # Copy gradient into output buffer, then this chunk's autograd graph is freed.
+            grad_student[start:end] = s_chunk.grad
+
+        # grad for: output_student, output_teacher, tp_group, chunk_size
+        return grad_student, None, None, None
+
+
 def chunked_kl_loss(output_student, output_teacher, tp_group, chunk_size=1024):
-    """
-    Chunked KL loss: processes the sequence dimension in slices of chunk_size.
-    Each chunk independently computes its softmax (with TP all-reduce) and KL div,
-    then sums over vocab (dim=-1) to get a small (chunk, batch) result.
-    The big (chunk, batch, vocab) intermediates are freed between chunks.
-
-    Returns per-token loss: shape (seq, batch) -- same as original.
-    """
-    slen = output_student.shape[0]
-    loss_chunks = []
-
-    for start in range(0, slen, chunk_size):
-        end = min(start + chunk_size, slen)
-        student_chunk = output_student[start:end]  # (chunk, b, vocab) -- this is a view, no copy
-        teacher_chunk = output_teacher[start:end]  # (chunk, b, vocab) -- this is a view, no copy
-
-        # Teacher softmax for this chunk
-        t_max, _ = torch.max(teacher_chunk, dim=-1)
-        dist.all_reduce(t_max, op=dist.ReduceOp.MAX, group=tp_group)
-        teacher_shifted = teacher_chunk - t_max.unsqueeze(dim=-1)
-
-        t_denom = torch.sum(torch.exp(teacher_shifted), dim=-1)
-        t_denom = all_reduce_autograd(t_denom, group=tp_group)
-
-        clen, bsz, sharded_vocab = student_chunk.shape
-
-        t_log_prob = teacher_shifted - torch.log(t_denom).view(clen, bsz, 1).expand(clen, bsz, sharded_vocab)
-        del teacher_shifted, t_denom  # free teacher intermediates
-
-        # Student softmax for this chunk
-        s_max, _ = torch.max(student_chunk, dim=-1)
-        dist.all_reduce(s_max, op=dist.ReduceOp.MAX, group=tp_group)
-        student_shifted = student_chunk - s_max.unsqueeze(dim=-1).detach()
-
-        s_denom = torch.sum(torch.exp(student_shifted), dim=-1)
-        s_denom = all_reduce_autograd(s_denom, group=tp_group)
-
-        s_log_prob = student_shifted - torch.log(s_denom).view(clen, bsz, 1).expand(clen, bsz, sharded_vocab)
-
-        # KL div for this chunk -> (chunk, batch)
-        chunk_loss = torch.sum(
-            F.kl_div(s_log_prob, t_log_prob, reduction="none", log_target=True),
-            dim=-1,
-        )
-        loss_chunks.append(chunk_loss)
-        # At this point, s_log_prob, t_log_prob, and the kl_div result (vocab-sized)
-        # are freed. Only chunk_loss (chunk, batch) survives.
-
-    return torch.cat(loss_chunks, dim=0)
+    """Wrapper: calls ChunkedKLDivFunction."""
+    return ChunkedKLDivFunction.apply(output_student, output_teacher, tp_group, chunk_size)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -148,7 +209,6 @@ def main():
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
 
-    # Initialize Megatron parallel state with TP=4, PP=1, no other parallelism.
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=4,
         pipeline_model_parallel_size=1,
@@ -157,8 +217,7 @@ def main():
     rank = dist.get_rank()
 
     # --- Test parameters ---
-    # Using smaller sizes than production so the test runs fast and doesn't OOM.
-    # The math is identical regardless of size.
+    # Small sizes so the test runs fast. Math is identical regardless of size.
     seq_len = 4096
     batch = 1
     full_vocab = 131072
@@ -166,14 +225,11 @@ def main():
     chunk_size = 1024
 
     # --- Create identical inputs for both runs ---
-    # We use a fixed seed per rank so each TP rank gets different vocab shards
-    # but both runs (original and chunked) see the same data.
     torch.manual_seed(42 + rank)
-
     student_logits_base = torch.randn(seq_len, batch, sharded_vocab, device="cuda", dtype=torch.float32)
     teacher_logits_base = torch.randn(seq_len, batch, sharded_vocab, device="cuda", dtype=torch.float32)
 
-    # --- Run ORIGINAL ---
+    # ──────────────── Run ORIGINAL ────────────────
     student_orig = student_logits_base.clone().requires_grad_(True)
     teacher_orig = teacher_logits_base.clone().detach()
 
@@ -182,7 +238,7 @@ def main():
     loss_orig_scalar.backward()
     grad_orig = student_orig.grad.clone()
 
-    # --- Run CHUNKED ---
+    # ──────────────── Run CHUNKED ────────────────
     student_chunked = student_logits_base.clone().requires_grad_(True)
     teacher_chunked = teacher_logits_base.clone().detach()
 
@@ -191,7 +247,7 @@ def main():
     loss_chunked_scalar.backward()
     grad_chunked = student_chunked.grad.clone()
 
-    # --- Compare ---
+    # ──────────────── Compare ────────────────
     loss_match = torch.allclose(loss_orig, loss_chunked, atol=1e-5, rtol=1e-5)
     grad_match = torch.allclose(grad_orig, grad_chunked, atol=1e-5, rtol=1e-5)
 
@@ -200,7 +256,7 @@ def main():
 
     if rank == 0:
         print("=" * 60)
-        print("KL LOSS CHUNKING TEST")
+        print("KL LOSS CHUNKING TEST (custom autograd)")
         print("=" * 60)
         print(f"  seq_len={seq_len}, batch={batch}, sharded_vocab={sharded_vocab}")
         print(f"  chunk_size={chunk_size}, TP=4")
